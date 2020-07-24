@@ -2,7 +2,7 @@ import struct
 import xml.etree.ElementTree as ET
 from PIL import Image
 import warnings
-
+import numpy as np
 
 class LifImage:
     """
@@ -11,7 +11,7 @@ class LifImage:
 
     Attributes:
         path (str): path / name of the image
-        dims (tuple): (x, y, z, t)
+        dims (tuple): (c, z, t, y, x, m)
         name (str): image name
         offsets (list): Byte position offsets for each image.
         filename (str): The name of the LIF file being read
@@ -27,21 +27,113 @@ class LifImage:
     """
 
     def __init__(self, image_info, offsets, filename):
-        self.dims = (
-            int(image_info["dims"][0]),
-            int(image_info["dims"][1]),
-            int(image_info["dims"][2]),
-            int(image_info["dims"][3]),
-        )
+        self.dims = tuple(image_info["dims"])  # CZTMYX
         self.path = image_info["path"]
         self.offsets = offsets
         self.info = image_info
         self.filename = filename
         self.name = image_info["name"]
         self.channels = image_info["channels"]
-        self.nz = int(image_info["dims"][2])
-        self.nt = int(image_info["dims"][3])
+        self.ch_offsets = image_info["ch_offsets"]
+        self.nz = int(image_info["dims"][1])
+        self.nt = int(image_info["dims"][2])
         self.scale = image_info["scale"]  # likely: image_info["scale"]
+        self.stride = image_info["stride"]
+        self.tile_positions = np.array(image_info["tile_positions"])
+        self.dtype = np.dtype('u{}'.format(int(image_info["ch_resolutions"][0] / 8)))
+        # TODO: DataType attribute
+        # TODO: FlipX, FlipY, SwapXY
+        # FIXME: TilePositions
+
+    def _get_item_np(self, n):
+        """
+        Gets specified item from the image set (private).
+        Args:
+            n (int): what item to retrieve
+
+        Returns:
+            Plane as 2D numpy array.
+        """
+
+        n_planes = np.prod(self.dims[:4])
+        if n >= n_planes:
+            raise ValueError("Invalid item trying to be retrieved.")
+
+        dims_yx = self.dims[-2:]
+
+        with open(self.filename, "rb") as image:
+
+            plane_size = np.int64(np.prod(dims_yx))
+            plane_bytes = np.int64(plane_size * np.dtype(self.dtype).itemsize)
+            offset = np.int64(self.offsets[0] + plane_bytes * n)
+
+            im = np.fromfile(
+                image,
+                dtype=self.dtype,
+                count=plane_size,
+                offset=offset,
+                )
+
+        return np.reshape(im, dims_yx)
+
+    def get_frame_np(self, z=0, t=0, c=0, m=0):
+        """
+        Gets the specified frame (z, t, c, m) from image.
+
+        Args:
+            z (int): z position
+            t (int): time point
+            c (int): channel
+            m (int): tile
+
+        Returns:
+            Plane as 2D numpy array.
+        """
+
+        dims_yx = self.dims[-2:]
+
+        offset = m * self.stride[3]
+        offset += t * self.stride[2]
+        offset += z * self.stride[1]
+        offset += c * self.stride[0]
+
+        with open(self.filename, "rb") as image:
+
+            im = np.fromfile(
+                image,
+                dtype=self.dtype,
+                count=int(np.prod(dims_yx)),
+                offset=int(offset),
+                )
+
+        return np.reshape(im, dims_yx)
+
+    def get_stack_np(self, m=0):
+        """
+        Gets the specified z-stack from image.
+
+        Args:
+            m (int): tile
+
+        Returns:
+            Z-stack as 4D (CZTYX) numpy array.
+            TODO: check T insertion
+        """
+
+        m_idx = 3
+        stackdims = self.dims[:m_idx] + self.dims[m_idx+1:]
+        offset = self.offsets[0] + int(m * self.stride[m_idx])
+
+        with open(self.filename, "rb") as image:
+
+            im = np.fromfile(
+                image,
+                dtype=self.dtype,
+                count=np.prod(stackdims),
+                offset=offset,
+                )
+
+        return np.reshape(im, stackdims)
 
     def _get_item(self, n):
         """
@@ -53,9 +145,9 @@ class LifImage:
             PIL image
         """
         n = int(n)
-        # Channels, times z, times t.
+        # Channels, times z, times t, times m.
         # This is the number of 'images' in the block.
-        seek_distance = self.channels * self.dims[2] * self.dims[3]
+        seek_distance = self.channels * self.dims[1] * self.dims[2] * self.dims[3]
         if n >= seek_distance:
             raise ValueError("Invalid item trying to be retrieved.")
         with open(self.filename, "rb") as image:
@@ -65,7 +157,7 @@ class LifImage:
                 # In the case of a blank image, we can calculate the length from
                 # the metadata in the LIF. When this is read by the parser,
                 # it is set to zero initially.
-                image_len = seek_distance * self.dims[0] * self.dims[1]
+                image_len = seek_distance * self.dims[4] * self.dims[5]
             else:
                 image_len = int(self.offsets[1] / seek_distance)
 
@@ -77,33 +169,88 @@ class LifImage:
                 data = b"\00" * image_len
             else:
                 data = image.read(image_len)
-            return Image.frombytes("L", (self.dims[0], self.dims[1]), data)
+            return Image.frombytes("L", (self.dims[4], self.dims[5]), data)
 
-    def get_frame(self, z=0, t=0, c=0):
+    def get_frame(self, z=0, t=0, c=0, m=0, return_as_np=False):
         """
-        Gets the specified frame (z, t, c) from image.
+        Gets the specified frame (z, t, c, m) from image.
 
         Args:
             z (int): z position
             t (int): time point
             c (int): channel
+            m (int): tile
 
         Returns:
-            Pillow Image object
+            Plane as 2D numpy array.
         """
+        z = int(z)
         t = int(t)
         c = int(c)
-        z = int(z)
+        m = int(m)
         if z >= self.nz:
             raise ValueError("Requested Z frame doesn't exist.")
         elif t >= self.nt:
             raise ValueError("Requested T frame doesn't exist.")
         elif c >= self.channels:
             raise ValueError("Requested channel doesn't exist.")
+        elif m >= self.dims[3]:
+            raise ValueError("Requested tile doesn't exist.")
 
-        total_items = self.channels * self.nz * self.nt
+        total_items = self.channels * self.nz * self.nt * self.dims[3]
 
-        t_offset = self.channels * self.nz
+        m_offset =  self.channels * self.nz * self.nt
+        m_requested = m_offset * m
+
+        t_offset =  self.channels * self.nz
+        t_requested = t_offset * t
+
+        c_offset = self.nz
+        c_requested = c_offset * c
+
+        z_requested = z
+
+        item_requested = m_requested + t_requested + z_requested + c_requested
+        if item_requested > total_items:
+            raise ValueError("The requested item is after the end of the image")
+
+        if return_as_np:
+            return self._get_item_np(item_requested)
+        else:
+            return self._get_item(item_requested)
+
+    def get_frame_tmp(self, z=0, t=0, c=0, m=0, return_as_np=False):
+        """
+        Gets the specified frame (z, t, c, m) from image.
+
+        Args:
+            z (int): z position
+            t (int): time point
+            c (int): channel
+            m (int): tile
+
+        Returns:
+            Plane as 2D numpy array.
+        """
+        z = int(z)
+        t = int(t)
+        c = int(c)
+        m = int(m)
+        if z >= self.nz:
+            raise ValueError("Requested Z frame doesn't exist.")
+        elif t >= self.nt:
+            raise ValueError("Requested T frame doesn't exist.")
+        elif c >= self.channels:
+            raise ValueError("Requested channel doesn't exist.")
+        elif m >= self.dims[3]:
+            raise ValueError("Requested tile doesn't exist.")
+
+        total_items = self.channels * self.nz * self.nt * self.dims[3]
+
+        m_offset =  self.channels * self.nz * self.nt
+        m_requested = m_offset * m
+
+        t_offset =  self.channels * self.nz
         t_requested = t_offset * t
 
         z_offset = self.channels
@@ -111,64 +258,93 @@ class LifImage:
 
         c_requested = c
 
-        item_requested = t_requested + z_requested + c_requested
+        item_requested = m_requested + t_requested + z_requested + c_requested
         if item_requested > total_items:
             raise ValueError("The requested item is after the end of the image")
 
-        return self._get_item(item_requested)
+        print(item_requested)
+        if return_as_np:
+            return self._get_item_np(item_requested)
+        else:
+            return self._get_item(item_requested)
 
-    def get_iter_t(self, z=0, c=0):
+    def get_iter_m(self, z=0, c=0, t=0):
         """
-        Returns an iterator over time t at position z and channel c.
+        Returns an iterator over tile m at time t, position z and channel c.
 
         Args:
             z (int): z position
             c (int): channel
+            t (int): timepoint
 
         Returns:
-            Iterator of Pillow Image objects
+            Iterator of 2D numpy arrays.
+        """
+        z = int(z)
+        c = int(c)
+        t = int(t)
+        m = 0
+        while m < self.dims[3]:
+            yield self.get_frame(z=z, t=t, c=c, m=m)
+            m += 1
+
+    def get_iter_t(self, z=0, c=0, m=0):
+        """
+        Returns an iterator over time t at tile m, position z and channel c.
+
+        Args:
+            z (int): z position
+            c (int): channel
+            m (int): tile
+
+        Returns:
+            Iterator of 2D numpy arrays.
         """
         z = int(z)
         c = int(c)
         t = 0
         while t < self.nt:
-            yield self.get_frame(z=z, t=t, c=c)
+            yield self.get_frame(z=z, t=t, c=c, m=m)
             t += 1
 
-    def get_iter_c(self, z=0, t=0):
+    def get_iter_c(self, z=0, t=0, m=0):
         """
-        Returns an iterator over the channels at time t and position z.
+        Returns an iterator over the channels at tile m, time t and position z.
 
         Args:
             z (int): z position
             t (int): time point
+            m (int): tile
 
         Returns:
-            Iterator of Pillow Image objects
+            Iterator of 2D numpy arrays.
         """
         t = int(t)
         z = int(z)
+        m = int(m)
         c = 0
         while c < self.channels:
-            yield self.get_frame(z=z, t=t, c=c)
+            yield self.get_frame(z=z, t=t, c=c, m=m)
             c += 1
 
-    def get_iter_z(self, t=0, c=0):
+    def get_iter_z(self, t=0, c=0, m=0):
         """
-        Returns an iterator over the z series of time t and channel c.
+        Returns an iterator over the z series of tile m, time t and channel c.
 
         Args:
             t (int): time point
             c (int): channel
+            m (int): tile
 
         Returns:
-            Iterator of Pillow Image objects
+            Iterator of 2D numpy arrays.
         """
         t = int(t)
         c = int(c)
+        m = int(m)
         z = 0
         while z < self.nz:
-            yield self.get_frame(z=z, t=t, c=c)
+            yield self.get_frame(z=z, t=t, c=c, m=m)
             z += 1
 
 
@@ -277,94 +453,60 @@ class LifFile:
                 self._recursive_image_find(item, return_list, appended_path)
 
             elif is_image:
-                # If additional XML data extraction is needed, add it here.
-                # Get number of frames (time points)
-                try:
-                    dim_t = item.find(
-                        "./Data/Image/ImageDescription/"
-                        "Dimensions/"
-                        "DimensionDescription"
-                        '[@DimID="4"]'
-                    ).attrib["NumberOfElements"]
-                except AttributeError:
-                    dim_t = 1
-
-                # Don't need a try / except block, all images have x and y
-                dim_x = item.find(
-                    "./Data/Image/ImageDescription/"
-                    "Dimensions/"
-                    "DimensionDescription"
-                    '[@DimID="1"]'
-                ).attrib["NumberOfElements"]
-                dim_y = item.find(
-                    "./Data/Image/ImageDescription/"
-                    "Dimensions/"
-                    "DimensionDescription"
-                    '[@DimID="2"]'
-                ).attrib["NumberOfElements"]
-                # Try to get z-dimension
-                try:
-                    dim_z = item.find(
-                        "./Data/Image/ImageDescription/"
-                        "Dimensions/"
-                        "DimensionDescription"
-                        '[@DimID="3"]'
-                    ).attrib["NumberOfElements"]
-                except AttributeError:
-                    dim_z = 1
 
                 # Determine number of channels
                 channel_list = item.findall(
                     "./Data/Image/ImageDescription/Channels/ChannelDescription"
                 )
-
                 n_channels = len(channel_list)
+                ch_offsets = [np.uint64(channel_list[ch].attrib["BytesInc"])
+                              for ch in range(n_channels)]
+                ch_resolutions = [int(channel_list[ch].attrib["Resolution"])
+                                  for ch in range(n_channels)]
 
-                # Find the scale of the image. All images have x and y,
-                # only some have z and t.
-                len_x = item.find(
-                    "./Data/Image/ImageDescription/"
-                    "Dimensions/"
-                    "DimensionDescription"
-                    '[@DimID="1"]'
-                ).attrib["Length"]  # Returns len in meters
-                scale_x = (int(dim_x) - 1) / (float(len_x) * 10**6)
-                len_y = item.find(
-                    "./Data/Image/ImageDescription/"
-                    "Dimensions/"
-                    "DimensionDescription"
-                    '[@DimID="2"]'
-                ).attrib["Length"]  # Returns len in meters
-                scale_y = (int(dim_y) - 1) / (float(len_y) * 10**6)
-                # Try to get z-dimension
-                try:
-                    len_z = item.find(
-                        "./Data/Image/ImageDescription/"
-                        "Dimensions/"
-                        "DimensionDescription"
-                        '[@DimID="3"]'
-                    ).attrib["Length"]  # Returns len in meters
-                    scale_z = int(dim_z) / (float(len_z) * 10**6)
-                except (AttributeError, ZeroDivisionError):
-                    scale_z = None
+                dims = [n_channels]
+                strides = [ch_offsets[1]]  # FIXME: assumes at least 2 channels
+                lengths = [float(n_channels - 1)]
+                scales = [float(1)]
 
-                try:
-                    len_t = item.find(
-                        "./Data/Image/ImageDescription/"
-                        "Dimensions/"
-                        "DimensionDescription"
-                        '[@DimID="4"]'
-                    ).attrib["Length"]  # Returns len in meters
-                    scale_t = int(dim_t) / float(len_t)
-                except (AttributeError, ZeroDivisionError):
-                    scale_t = None
+                for dim in [3, 4, 10, 2, 1]:  # C+ZTMYX
+                    try:
+                        dd = item.find(
+                            "./Data/Image/ImageDescription/"
+                            "Dimensions/"
+                            "DimensionDescription"
+                            '[@DimID="{}"]'.format(dim)
+                        )
+                        dims.append(int(dd.attrib["NumberOfElements"]))
+                        strides.append(np.uint64(dd.attrib["BytesInc"]))
+                        lengths.append(float(dd.attrib["Length"]))
+                    except AttributeError:
+                        dims.append(int(1))
+                        strides.append(int(0))
+                        lengths.append(float(1))
+
+                scales.append( dims[1] / (lengths[1] * 10**6) )
+                scales.append( dims[2] / lengths[2] )
+                scales.append( float(1) )
+                scales.append( (dims[4] - 1) / (lengths[4] * 10**6) )
+                scales.append( (dims[5] - 1) / (lengths[5] * 10**6) )
+
+                PosX, PosY = [], []
+                tiles = item.findall("./Data/Image/Attachment/Tile")
+                for tile in tiles:
+                    PosX.append(float(tile.attrib["PosX"]) * 1e6)
+                    PosY.append(float(tile.attrib["PosY"]) * 1e6)
 
                 data_dict = {
-                    "dims": (dim_x, dim_y, dim_z, dim_t),
+                    "dims": dims,
                     "path": str(path + "/"),
                     "name": item.attrib["Name"],
                     "channels": n_channels,
-                    "scale": (scale_x, scale_y, scale_z, scale_t),
+                    "ch_offsets": ch_offsets,
+                    "ch_resolutions": ch_resolutions,
+                    "scale": scales,
+                    "stride": strides,
+                    "tile_positions": [PosX, PosY],
                 }
 
                 return_list.append(data_dict)
