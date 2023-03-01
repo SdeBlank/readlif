@@ -55,7 +55,7 @@ class LifImage:
             Plane as 2D numpy array.
         """
 
-        n_planes = np.prod(self.dims[:4])
+        n_planes = np.prod(self.dims[:4], dtype=np.int64)
         if n >= n_planes:
             raise ValueError("Invalid item trying to be retrieved.")
 
@@ -63,7 +63,7 @@ class LifImage:
 
         with open(self.filename, "rb") as image:
 
-            plane_size = np.int64(np.prod(dims_yx))
+            plane_size = np.int64(np.prod(dims_yx, dtype=np.int64))
             plane_bytes = np.int64(plane_size * np.dtype(self.dtype).itemsize)
             offset = np.int64(self.offsets[0] + plane_bytes * n)
 
@@ -102,7 +102,7 @@ class LifImage:
             im = np.fromfile(
                 image,
                 dtype=self.dtype,
-                count=int(np.prod(dims_yx)),
+                count=int(np.prod(dims_yx, dtype=np.int64)),
                 offset=int(offset),
                 )
 
@@ -129,7 +129,7 @@ class LifImage:
             im = np.fromfile(
                 image,
                 dtype=self.dtype,
-                count=np.prod(stackdims),
+                count=np.prod(stackdims, dtype=np.int64),
                 offset=offset,
                 )
 
